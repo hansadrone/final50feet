@@ -46,7 +46,7 @@ async def getPos(drone):
 async def run():
 
     # Hansadrone.com API key. use lowercase characters only
-    APIkey = "7jd10cb8t6fw8p07"
+    APIkey = "<put your API key here>"
 
     # system settings
     # altitude above ground for cruise flight (m)
