@@ -6,7 +6,7 @@
 # Also, comment out the ultrasonic disctance sensor section if no sensor is available
 # Set the system settings in the main function before running this script!
 
-# Copyright 2020 hansadrone.com
+# Copyright 2022 hansadrone.com
 
 # LICENSE STATEMENT
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
@@ -49,26 +49,24 @@ async def run():
 
     # system settings
     # altitude above ground for cruise flight (m)
-    alt_cruise = 15.00
+    alt_cruise = 30.00
     # max speed during cruise (m/s)
     max_speed=2.00
     # speed for approach flight (m/s)
     apr_speed = 1.00
     # max distance between takeoff location and fixpoint (m). Also used for geofence range
-    range=100.0
+    range=200.0
     # the maximum altitude above takeoff altitude (m) for geofence altitude
-    max_alt=30.0
-    # altitude of the user above takeoff altitude (m)
-    alt_user = 1.5
-    # This is the maximum range of the distance (cm)
-    sensor_range=765
+    max_alt=100.0
+    # This is the maximum range of the distance sensor(cm)
+    sensor_range=700
 
     # connect to drone
     drone = System()
     # connect to local jmavsim simulator on Windows or Linux PC
-    await drone.connect(system_address="udp://:14540")
+    # await drone.connect(system_address="udp://:14540")
     # connect to real drone over COM port on Windows PC
-    # await drone.connect(system_address="serial:///COM5")
+    await drone.connect(system_address="serial:///COM5")
     # connect to real drone over COM port on Linux PC
     # await drone.connect(system_address="serial:///path/to/serial/dev[:baudrate]")
     print("-- Waiting for drone...")
@@ -107,13 +105,17 @@ async def run():
     await drone.param.set_param_int('COM_LOW_BAT_ACT', 3)
     # return home if offboard signal lost
     await drone.param.set_param_int('COM_OBL_ACT', 2)
-    # return home if RC connected but offboard lost
+    # return home if RC connected but offboard signal lost
     await drone.param.set_param_int('COM_OBL_RC_ACT', 3)
-    # time-out for offboard lost action
+    # time-out for offboard signal lost action
     await drone.param.set_param_float('COM_OF_LOSS_T', 1.0)
     # auto disarm after landing
     await drone.param.set_param_float('COM_DISARM_LAND', 10.0)
-    # todo: deactivate loiter on GPS lost during approach fligh
+    # Return home at this altitude
+    await drone.param.set_param_float('RTL_RETURN_ALT', alt_cruise)
+    # time-out for GPS signal lost ACTION
+    await drone.param.set_param_float('COM_POS_FS_DELAY', 1)
+    # todo: deactivate loiter on GPS lost during approach fligh in GPS denied areas
     # await drone.param.set_param_int('NAV_GPS_LT', 0)
 
     # setting drone flight and mode parameters
@@ -191,6 +193,7 @@ async def run():
     INC=data['inc']
     LAT=data['lat']
     LONG=data['long']
+    alt_user=data['alt']
     print("-- Getting corridor data\nCompass: %s\nInclination: %s\nLatitude: %s\nLongitude: %s"%(COMP, INC, LAT, LONG))
     if COMP==0 or INC==0 or LAT==0 or LONG==0:
         print("Corridor data not valid, aborting")
@@ -370,12 +373,13 @@ async def run():
     print("distance: " + str(dist)+ "distance1: " + " altitude: " + str(alt) + "absX: " + str(absX) + " absY: " + str(absY))
 
     # start offboard mode
-    # set first setpoint before offboard mode can be enabled
+    # set first setpoint in velocityNED before offboard mode can be enabled
     # repeat again as this sometimes doesnt get enabled
-    myPosition=PositionNedYaw( 0.00, 0.00, altitude2, yaw)
-    await drone.offboard.set_position_ned(myPosition)
+    await drone.offboard.set_velocity_ned(VelocityNedYaw(0.00, 0.00, 0.00, yaw))
     await asyncio.sleep(1)
-    await drone.offboard.set_position_ned(myPosition)
+    await drone.offboard.set_velocity_ned(VelocityNedYaw(0.00, 0.00, 0.00, yaw))
+    await asyncio.sleep(1)
+
     print("-- starting offboard mode")
     try:
       await drone.offboard.start()
@@ -392,9 +396,10 @@ async def run():
     # this part to be repeated for each step until drone has reached sensor contact
     # stop loop if distance < 765cm or <alt_user and start final approach mode
     # all angles in RAD in this section
+
     while s_distance>=sensor_range and alt >alt_user:
 
-    # while loop to wait for drone to be recognized. exit if not recognized within 10 s
+      # while loop to wait for drone to be recognized. exit if not recognized within 10 s
       print("-- waiting 10s for drone to be recognized...")
       URL = "https://hansadrone.com/api/getMobileStatus/?apiKey=%s"%(APIkey)
       i=0
@@ -419,29 +424,33 @@ async def run():
           await asyncio.sleep(1)
           i+=1
 
-    # get deviations from server
+      # get deviations from server
       URL = "https://hansadrone.com/api/getDeviations/?apiKey=%s"%(APIkey)
       r=requests.get(url=URL)
       data = r.json()
       devX=float(data['devX'])
       devY=float(data['devY'])
-      angX=devX * pi / 180
-      angY=devY * pi /180
-      print("-- drone recognized. devX: %s devY: %s"%(devX, devY))
+      if isEqual(devX, 99) or isEqual(devY, 99.0):
+        print("-- drone outside corridor, trying again..")
+        continue
+      else:
+        angX=devX * pi / 180
+        angY=devY * pi /180
+        print("-- drone recognized. devX: %s devY: %s"%(devX, devY))
 
-    # get actual position from drone telemetry.
+      # get actual position from drone telemetry.
       lat, lon, alt = await getPos(drone)
       print("Drone altitude: " + str(alt))
 
-    # calculate distance, stepLength and absolute deviations
+      # calculate distance, stepLength and absolute deviations
       dist =  (alt-alt_user) /tan(inc+angY)
       stepLength=dist/3.0
       absX = dist * sin(angX)
       absY = alt - alt_user - tan(inc) * dist
       print("distance: " + str(dist)+ " altitude: " + str(alt) + "absX: " + str(absX) + " absY: " + str(absY))
 
-    # calculate new x position: moving inwards absX at corrected angle, moving forwards at stepLength
-    # todo: catch 0 and 360 degree issues and validate formula
+      # calculate new x position: moving inwards absX at corrected angle, moving forwards at stepLength
+      # todo: catch 0 and 360 degree issues and validate formula
       l=sqrt(absX**2 + stepLength**2)
       if angX < 0:
         stepAngle = comp1RAD -0.5*pi + angle + asin(stepLength/l)
@@ -452,38 +461,38 @@ async def run():
       north = l * cos(stepAngle)
       east = l * sin(stepAngle)
 
-    # calculate new Y position: move up/down by absY, forward a step and down according to inc
+      # calculate new Y position: move up/down by absY, forward a step and down according to inc
       down = -(alt - stepLength * tan(inc) -absY)
       if down < -alt_user:
         down = -alt_user
-        print("new drone position \nNorth: " + str(north) + "\nEast: " + str(east) + "\nDown: " + str(down) + "\nYaw: " + str(yaw))
+      print("new drone position \nNorth: " + str(north) + "\nEast: " + str(east) + "\nDown: " + str(down) + "\nYaw: " + str(yaw))
 
-    # convert NED coordinates to NED velocity
-    # calculate absolute distance to next setpoint
+      # convert NED coordinates to NED velocity
+      # calculate absolute distance to next setpoint
       s = sqrt(north**2 + east**2 + down**2)
-    # calculate the time it takes to get there
+      # calculate the time it takes to get there
       t = s / apr_speed
-    # calculate velocity components, down velocity is positive
+      # calculate velocity components, down velocity is positive
       v_north = north / t
       v_east = east / t
       v_down = (alt+down) / t
 
-    # Start offboard mode NEDvelocity for time t and then stop again
+      # Start offboard mode NEDvelocity for time t and then stop again
       print("-- Starting offboard velocity_NED. V_north:" + str(v_north) + " v_east: "+ str(v_east) +" v_down: " + str(v_down) + " time: " + str(t))
       await drone.offboard.set_velocity_ned(VelocityNedYaw(v_north, v_east, v_down, yaw))
       await asyncio.sleep(t)
       await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, yaw))
       await asyncio.sleep(1)
 
-    # get sensor distance
-    # comment out this section  when flying in a simulator
+      # get sensor distance
+      # comment out this section  when flying in a simulator
       async for sensor in drone.telemetry.distance_sensor():
         s_distance=sensor.current_distance_m
         print("sensor distance: %s"%(s_distance))
         break
       await asyncio.sleep(1)
 
-    # get new actual position from drone telemetry.
+      # get new actual position from drone telemetry.
       lat, lon, alt = await getPos(drone)
 
     # end of while loop
@@ -504,8 +513,10 @@ async def run():
     angX=devX * pi / 180
     angY=devY * pi /180
 
+    # comment out this section and set sensor distance to fix value if flying in a simulator
     async for sensor in drone.telemetry.distance_sensor():
       s_distance=sensor.current_distance_m
+      s_distance=500
       print("sensor distance: %s"%(s_distance))
       break
 
@@ -526,10 +537,10 @@ async def run():
       stepAngle = comp1RAD -angX
     else:
       stepAngle = comp1RAD +angX
-      if stepAngle > 2*pi:
-        stepAngle = stepAngle -2*pi
-        north = distance * cos(stepAngle)
-        east = distance * sin(stepAngle)
+    if stepAngle > 2*pi:
+      stepAngle = stepAngle -2*pi
+    north = distance * cos(stepAngle)
+    east = distance * sin(stepAngle)
 
     # calculate new Y position: move up/down by absY, forward at distance and down according to inc
     down = -(alt - stepLength * tan(inc) -absY)
