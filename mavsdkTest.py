@@ -30,7 +30,8 @@
 import asyncio
 import requests
 import pyproj
-from math import radians, acos, sin, cos, tan, sqrt, atan2, pi, asin
+import configparser
+from math import radians, acos, sin, cos, tan, sqrt, atan2, pi, asin, isclose
 from mavsdk import System
 from mavsdk.offboard import (OffboardError, PositionNedYaw, VelocityNedYaw)
 
@@ -44,31 +45,28 @@ async def getPos(drone):
 # main function starts here ------------------------------------------------------------------------------------
 async def run():
 
-    # Hansadrone.com API key. use lowercase characters only
-    APIkey = "<PUT YOUR API KEY HERE>"
+    # load system settings and configuration from hansadrone.ini file
+    # Please make all necessary setting in the hansadrone.ini file
+    config = configparser.ConfigParser()
+    config.read('hansadrone.ini')
 
-    # system settings
-    # altitude above ground for cruise flight (m)
-    alt_cruise = 30.00
-    # max speed during cruise (m/s)
-    max_speed=2.00
-    # speed for approach flight (m/s)
-    apr_speed = 1.00
-    # max distance between takeoff location and fixpoint (m). Also used for geofence range
-    range=200.0
-    # the maximum altitude above takeoff altitude (m) for geofence altitude
-    max_alt=100.0
-    # This is the maximum range of the distance sensor(cm)
-    sensor_range=700
+    APIkey = config['API']['APIkey']
+
+    alt_cruise = float(config['Flight settings']['alt_cruise'])
+    max_speed = float(config['Flight settings']['max_speed'])
+    apr_speed = float(config['Flight settings']['apr_speed'])
+    range = float(config['Flight settings']['range'])
+    max_alt = float(config['Flight settings']['max_alt'])
+
+    system_address = config['Drone connection']['system_address']
+
+    distance_sensor = config['Sensor'].getboolean('distance_sensor')
+    sensor_range = int(config['Sensor']['sensor_range'])
 
     # connect to drone
+    # connection details are defined in hansadrone.ini file
     drone = System()
-    # connect to local jmavsim simulator on Windows or Linux PC
-    # await drone.connect(system_address="udp://:14540")
-    # connect to real drone over COM port on Windows PC
-    await drone.connect(system_address="serial:///COM5")
-    # connect to real drone over COM port on Linux PC
-    # await drone.connect(system_address="serial:///path/to/serial/dev[:baudrate]")
+    await drone.connect(system_address = system_address)
     print("-- Waiting for drone...")
     async for state in drone.core.connection_state():
         if state.is_connected:
@@ -114,7 +112,7 @@ async def run():
     # Return home at this altitude
     await drone.param.set_param_float('RTL_RETURN_ALT', alt_cruise)
     # time-out for GPS signal lost ACTION
-    await drone.param.set_param_float('COM_POS_FS_DELAY', 1)
+    # await drone.param.set_param_float('COM_POS_FS_DELAY', 1)
     # todo: deactivate loiter on GPS lost during approach fligh in GPS denied areas
     # await drone.param.set_param_int('NAV_GPS_LT', 0)
 
@@ -193,8 +191,8 @@ async def run():
     INC=data['inc']
     LAT=data['lat']
     LONG=data['long']
-    alt_user=data['alt']
-    print("-- Getting corridor data\nCompass: %s\nInclination: %s\nLatitude: %s\nLongitude: %s"%(COMP, INC, LAT, LONG))
+    alt_user=float(data['alt'])
+    print("-- Getting corridor data\nCompass: %s\nInclination: %s\nLatitude: %s\nLongitude: %s\nUser Altitude: %s"%(COMP, INC, LAT, LONG, alt_user))
     if COMP==0 or INC==0 or LAT==0 or LONG==0:
         print("Corridor data not valid, aborting")
         URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
@@ -354,7 +352,9 @@ async def run():
     print("Drone altitude: " + str(alt))
 
     # calculate corrected yaw angle for the drone during approach flight. This is in degrees.
-    angle = 0.5 * angX
+    # angle is half the deviation to correct the drone position
+    angle = 0.5 * devX
+    angleRAD = angle * pi / 180
     yaw=(comp1RAD - angX) * 180 / pi
     if yaw > 360:
       yaw = yaw-360
@@ -364,13 +364,13 @@ async def run():
 
     # calculate distance based on recognized inclination angle and altitude difference
     # distance is the absolute distance including height difference, not the distance on ground.
-    dist = (alt-alt_user) /sin(inc+angY)
+    dist = ((alt+z)-alt_user) /sin(inc+angY)
 
     # calculate absolute deviations
     # absolute deviations are relative to a corridor centric coordinate system and not to the ground based system
-    absX = dist * sin(angX)
-    absY= dist*sin(angY)
-    print("distance: " + str(dist)+ "distance1: " + " altitude: " + str(alt) + "absX: " + str(absX) + " absY: " + str(absY))
+    absX = dist * tan(angX)
+    absY= dist*tan(angY)
+    print("distance: " + str(dist)+ " altitude: " + str(alt) + " absX: " + str(absX) + " absY: " + str(absY))
 
     # start offboard mode
     # set first setpoint in velocityNED before offboard mode can be enabled
@@ -378,7 +378,6 @@ async def run():
     await drone.offboard.set_velocity_ned(VelocityNedYaw(0.00, 0.00, 0.00, yaw))
     await asyncio.sleep(1)
     await drone.offboard.set_velocity_ned(VelocityNedYaw(0.00, 0.00, 0.00, yaw))
-    await asyncio.sleep(1)
 
     print("-- starting offboard mode")
     try:
@@ -394,10 +393,10 @@ async def run():
       return
 
     # this part to be repeated for each step until drone has reached sensor contact
-    # stop loop if distance < 765cm or <alt_user and start final approach mode
+    # stop loop if distance < 765cm or <alt_user + 2 meters and start final approach mode
     # all angles in RAD in this section
 
-    while s_distance>=sensor_range and alt >alt_user:
+    while s_distance>=sensor_range and (alt+z) >(alt_user+2):
 
       # while loop to wait for drone to be recognized. exit if not recognized within 10 s
       print("-- waiting 10s for drone to be recognized...")
@@ -430,7 +429,7 @@ async def run():
       data = r.json()
       devX=float(data['devX'])
       devY=float(data['devY'])
-      if isEqual(devX, 99) or isEqual(devY, 99.0):
+      if isclose(devX, 99) or isclose(devY, 99):
         print("-- drone outside corridor, trying again..")
         continue
       else:
@@ -443,33 +442,34 @@ async def run():
       print("Drone altitude: " + str(alt))
 
       # calculate distance, stepLength and absolute deviations
-      dist =  (alt-alt_user) /tan(inc+angY)
+      dist =  ((alt+z)-alt_user) /sin(inc+angY)
       stepLength=dist/3.0
-      absX = dist * sin(angX)
-      absY = alt - alt_user - tan(inc) * dist
-      print("distance: " + str(dist)+ " altitude: " + str(alt) + "absX: " + str(absX) + " absY: " + str(absY))
+      absX = dist * tan(angX)
+      absY = dist * tan(angY)
+      print("distance: " + str(dist)+ " altitude: " + str(alt) + " steplength:" +str(stepLength)+" absX: " + str(absX) + " absY: " + str(absY))
 
       # calculate new x position: moving inwards absX at corrected angle, moving forwards at stepLength
       # todo: catch 0 and 360 degree issues and validate formula
       l=sqrt(absX**2 + stepLength**2)
       if angX < 0:
-        stepAngle = comp1RAD -0.5*pi + angle + asin(stepLength/l)
+        stepAngle = comp1RAD -0.5*pi + angleRAD + asin(stepLength/l)
       else:
-        stepAngle = comp1RAD +0.5*pi -angle - asin(stepLength/l)
+        stepAngle = comp1RAD +0.5*pi -angleRAD - asin(stepLength/l)
       if stepAngle > 2*pi:
         stepAngle = stepAngle -2*pi
       north = l * cos(stepAngle)
       east = l * sin(stepAngle)
 
       # calculate new Y position: move up/down by absY, forward a step and down according to inc
-      down = -(alt - stepLength * tan(inc) -absY)
-      if down < -alt_user:
-        down = -alt_user
+      # down is in NED coordinates, negative values from drone to ground
+      down = -(alt - stepLength * sin(inc) -absY)
+      if down > -(alt_user-z):
+        down = -(alt_user-z)
       print("new drone position \nNorth: " + str(north) + "\nEast: " + str(east) + "\nDown: " + str(down) + "\nYaw: " + str(yaw))
 
       # convert NED coordinates to NED velocity
       # calculate absolute distance to next setpoint
-      s = sqrt(north**2 + east**2 + down**2)
+      s = sqrt(north**2 + east**2 + (alt+down)**2)
       # calculate the time it takes to get there
       t = s / apr_speed
       # calculate velocity components, down velocity is positive
@@ -478,18 +478,31 @@ async def run():
       v_down = (alt+down) / t
 
       # Start offboard mode NEDvelocity for time t and then stop again
+      # flying 2 seconds longer than calculated to allow the drone to start/stop
       print("-- Starting offboard velocity_NED. V_north:" + str(v_north) + " v_east: "+ str(v_east) +" v_down: " + str(v_down) + " time: " + str(t))
       await drone.offboard.set_velocity_ned(VelocityNedYaw(v_north, v_east, v_down, yaw))
-      await asyncio.sleep(t)
+      # await asyncio.sleep(t+speedup)
+
+      # monitor altitude until calculated altitude reached
+      while alt > -down+1:
+        async for pos in drone.telemetry.position():
+          alt=pos.relative_altitude_m
+          print("altitude: %.2fm" % alt)
+          break
+        await asyncio.sleep(1)
+
       await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, yaw))
       await asyncio.sleep(1)
 
       # get sensor distance
-      # comment out this section  when flying in a simulator
-      async for sensor in drone.telemetry.distance_sensor():
-        s_distance=sensor.current_distance_m
-        print("sensor distance: %s"%(s_distance))
-        break
+      # this will only be used if distance_sensor= in hansadrone.ini file
+      if distance_sensor:
+        async for sensor in drone.telemetry.distance_sensor():
+          s_distance=sensor.current_distance_m
+          print("sensor distance: %s"%(s_distance))
+          break
+
+
       await asyncio.sleep(1)
 
       # get new actual position from drone telemetry.
@@ -499,6 +512,12 @@ async def run():
 
     # final approach. user can turn his smartphone away now, open hatch and turn off the light
     print("-- Starting final approach")
+
+    # update backend status to "arrived" to trigger the UI in the app to put the smartphone aside
+    print("-- Setting drone status to arrived")
+    URL = "https://hansadrone.com/api/setDroneStatus?dStatus=completed&apiKey=%s"%(APIkey)
+    r=requests.get(url=URL)
+    await asyncio.sleep(2)
 
     # get actual position from drone telemetry.
     lat, lon, alt = await getPos(drone)
@@ -513,77 +532,73 @@ async def run():
     angX=devX * pi / 180
     angY=devY * pi /180
 
-    # comment out this section and set sensor distance to fix value if flying in a simulator
-    async for sensor in drone.telemetry.distance_sensor():
-      s_distance=sensor.current_distance_m
-      s_distance=500
-      print("sensor distance: %s"%(s_distance))
-      break
-
-    # update backend status to "arrived" to trigger the UI in the app to put the smartphone aside
-    print("-- Setting drone status to arrived")
-    URL = "https://hansadrone.com/api/setDroneStatus?dStatus=completed&apiKey=%s"%(APIkey)
-    r=requests.get(url=URL)
-    await asyncio.sleep(2)
-
-    # calculate final step
-    distance=s_distance/100
-    absX=distance*sin(angX)
-    absY=distance * sin(angY)
-
-    # calculate final x position: moving inwards at recognized angle, forward at distance
-    # todo: catch 0 and 360 degree issues and validate formula
-    if angX < 0:
-      stepAngle = comp1RAD -angX
-    else:
-      stepAngle = comp1RAD +angX
-    if stepAngle > 2*pi:
-      stepAngle = stepAngle -2*pi
-    north = distance * cos(stepAngle)
-    east = distance * sin(stepAngle)
-
-    # calculate new Y position: move up/down by absY, forward at distance and down according to inc
-    down = -(alt - stepLength * tan(inc) -absY)
-    if down < -alt_user:
-      down = -alt_user
-    print("new drone position \nNorth: " + str(north) + "\nEast: " + str(east) + "\nDown: " + str(down) + "\nYaw: " + str(yaw))
-
-    # convert NED coordinates to NED velocity
-    # calculate absolute distance to the customer
-    s = sqrt(north**2 + east**2 + down**2)
-    # calculate the time it takes to get there
-    t = s / apr_speed
-    # calculate velocity components, down velocity is positive
-    v_north = north / t
-    v_east = east / t
-    v_down = (alt+down) / t
-
-    # start NEDvelocity and monitor sensor disctance
-    await drone.offboard.set_velocity_ned(VelocityNedYaw(v_north, v_east, v_down, yaw))
-    while s_distance > 100:
+    # final step will only be executed if distance_sensor is available
+    if distance_sensor:
       async for sensor in drone.telemetry.distance_sensor():
         s_distance=sensor.current_distance_m
         print("sensor distance: %s"%(s_distance))
         break
-      await asyncio.sleep(1)
 
-    # stop in front of customer for unloading
-    await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, yaw))
-    await asyncio.sleep(10)
+      # calculate final step
+      distance=s_distance/100
+      absX=distance*sin(angX)
+      absY=distance * sin(angY)
 
-    # stop offboard mode. this requires GPS fix
-    print("-- stopping offboard mode")
-    try:
-      await drone.offboard.stop()
-    except OffboardError as error:
-      print(f"Stopping offboard mode failed with error code: {error._result.result}")
-      print("returning home")
-      await drone.action.return_to_launch()
-      URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
-      r=requests.get(url=URL)
-      URL = "https://hansadrone.com/api/setMobileStatus?mStatus=unknown&apiKey=%s"%(APIkey)
-      r=requests.get(url=URL)
-      return
+      # calculate final x position: moving inwards at recognized angle, forward at distance
+      # todo: catch 0 and 360 degree issues and validate formula
+      if angX < 0:
+        stepAngle = comp1RAD -angX
+      else:
+        stepAngle = comp1RAD +angX
+      if stepAngle > 2*pi:
+        stepAngle = stepAngle -2*pi
+      north = distance * cos(stepAngle)
+      east = distance * sin(stepAngle)
+
+      # calculate new Y position: move up/down by absY, forward at distance and down according to inc
+      down = -(alt - distance * tan(inc) -absY)
+      if down < -(alt_user-z):
+        down = -(alt_user-z)
+      print("new drone position \nNorth: " + str(north) + "\nEast: " + str(east) + "\nDown: " + str(down) + "\nYaw: " + str(yaw))
+
+      # convert NED coordinates to NED velocity
+      # calculate absolute distance to the customer
+      s = sqrt(north**2 + east**2 + down**2)
+      # calculate the time it takes to get there
+      t = s / apr_speed
+      # calculate velocity components, down velocity is positive
+      v_north = north / t
+      v_east = east / t
+      v_down = (alt+down) / t
+
+      # start NEDvelocity and monitor sensor disctance
+      # stop 100 cm in front of user
+      await drone.offboard.set_velocity_ned(VelocityNedYaw(v_north, v_east, v_down, yaw))
+      while s_distance > 100:
+        async for sensor in drone.telemetry.distance_sensor():
+          s_distance=sensor.current_distance_m
+          print("sensor distance: %s"%(s_distance))
+          break
+        await asyncio.sleep(1)
+
+      # stop in front of customer for unloading
+      await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, yaw))
+      await asyncio.sleep(10)
+
+      # stop offboard mode. this requires GPS fix
+      print("-- stopping offboard mode")
+      try:
+        await drone.offboard.stop()
+      except OffboardError as error:
+        print(f"Stopping offboard mode failed with error code: {error._result.result}")
+        print("returning home")
+        await drone.action.return_to_launch()
+        URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
+        r=requests.get(url=URL)
+        URL = "https://hansadrone.com/api/setMobileStatus?mStatus=unknown&apiKey=%s"%(APIkey)
+        r=requests.get(url=URL)
+        return
+    # end of final step
 
     # update backend status to completed
     print("-- Setting drone status to completed")
@@ -640,10 +655,6 @@ async def run():
       async for pos in drone.telemetry.position():
         lat, lon, alt=pos.latitude_deg, pos.longitude_deg, pos.relative_altitude_m
         print("Latitude: %s, Longitude: %s, Altitude: %.2fm"%(lat, lon, alt))
-        break
-      async for sensor in drone.telemetry.distance_sensor():
-        s_distance=sensor.current_distance_m
-        print("sensor distance: %scm"%(s_distance))
         break
       await asyncio.sleep(1)
     # end of while
