@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# This is a test script to demonstrate the usage of the hansadrone.com precision navigation service with a mavlink enabled drone or simulator
-# If running this script in a Simulator, the drone takeoff location needs to be set to near local position (within "range") before running this script!
-# Also, comment out the ultrasonic disctance sensor section if no sensor is available
-# Set the system settings in the main function before running this script!
+# This is a test script to demonstrate the usage of the hansadrone.com precision navigation service with a mavlink enabled drone or simulator.
+# This script uses the MAVSDK python library which needs to be installed first using "pip3 install mavsdk"
+# If running this script in a simulator like jmavsim, the drone takeoff location needs to be set in the simulator to near local position (within "range") before running this script!
+# Set the system settings in the hansadrone.ini config file before running this script!
 
 # Copyright 2022 hansadrone.com
 
@@ -26,6 +26,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+# ------------------------------------------------------------------------------------------------------------
 
 import asyncio
 import requests
@@ -35,17 +36,45 @@ from math import radians, acos, sin, cos, tan, sqrt, atan2, pi, asin, isclose
 from mavsdk import System
 from mavsdk.offboard import (OffboardError, PositionNedYaw, VelocityNedYaw)
 
-# helper function to get drone telemetry
+# helper function to get drone telemetry--------------------------------------------------------------------
 async def getPos(drone):
     # Get GPS position data from telemetry
     async for pos in drone.telemetry.position():
         lat, lon, alt = pos.latitude_deg, pos.longitude_deg, pos.relative_altitude_m
         return lat, lon, alt
 
+# helper function to wait to get mobile status from backend and exit/return home if timeout
+async def getmStatus(status, returnHome, waitTime, APIkey):
+  print("-- waiting " +  str(waitTime) + "s for mobile status to be " + status + "... --")
+  URL = "https://hansadrone.com/api/getMobileStatus/?apiKey=%s"%(APIkey)
+  i=0
+  while i<waitTime :
+    r=requests.get(url=URL)
+    data = r.json()
+    MSTATUS=data['status']
+    if MSTATUS==status :
+      print("Mobile Status: %s"%(MSTATUS))
+      i=waitTime
+      return
+    elif i==waitTime :
+      print("connection timed out, aborting")
+      URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
+      r=requests.get(url=URL)
+      URL = "https://hansadrone.com/api/setMobileStatus?mStatus=unknown&apiKey=%s"%(APIkey)
+      r=requests.get(url=URL)
+      if returnHome:
+        print("-- returning home")
+        await drone.action.return_to_launch()
+      exit()
+    else :
+      print("waiting...")
+      await asyncio.sleep(5)
+      i+=5
+
 # main function starts here ------------------------------------------------------------------------------------
 async def run():
 
-    # load system settings and configuration from hansadrone.ini file
+    # loading system settings and configuration from hansadrone.ini file
     # Please make all necessary setting in the hansadrone.ini file
     config = configparser.ConfigParser()
     config.read('hansadrone.ini')
@@ -78,7 +107,7 @@ async def run():
     URL = "https://hansadrone.com/api/setDroneStatus?dStatus=connected&apiKey=%s"%(APIkey)
     r=requests.get(url=URL)
 
-    # wait for drone to get GPS fix and obtain takeoff location
+    # wait for drone to get GPS fix
     print("-- Waiting for drone to have a global position estimate...")
     async for health in drone.telemetry.health():
         if health.is_global_position_ok:
@@ -99,7 +128,7 @@ async def run():
 
     # setting drone failsafe parameters
     print("-- setting drone failsafe parameters")
-    # fly home if bat low or land if bat critical
+    # return home if bat low or land if bat critical
     await drone.param.set_param_int('COM_LOW_BAT_ACT', 3)
     # return home if offboard signal lost
     await drone.param.set_param_int('COM_OBL_ACT', 2)
@@ -111,8 +140,6 @@ async def run():
     await drone.param.set_param_float('COM_DISARM_LAND', 10.0)
     # Return home at this altitude
     await drone.param.set_param_float('RTL_RETURN_ALT', alt_cruise)
-    # time-out for GPS signal lost ACTION
-    # await drone.param.set_param_float('COM_POS_FS_DELAY', 1)
     # todo: deactivate loiter on GPS lost during approach fligh in GPS denied areas
     # await drone.param.set_param_int('NAV_GPS_LT', 0)
 
@@ -131,54 +158,16 @@ async def run():
     await drone.param.set_param_float('GF_MAX_HOR_DIST', range)
     await drone.param.set_param_float('LNDMC_ALT_MAX', max_alt)
 
-    # while loop to wait for mobile to connect. exit if not connected within 60 s
-    print("-- waiting 60s for mobile to connect...")
-    URL = "https://hansadrone.com/api/getMobileStatus/?apiKey=%s"%(APIkey)
-    i=0
-    while i<12 :
-      r=requests.get(url=URL)
-      data = r.json()
-      MSTATUS=data['status']
-      if MSTATUS=="connected" :
-        print("Mobile Status: %s"%(MSTATUS))
-        i=12
-      elif i==11 :
-        print("connection timed out, aborting")
-        URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
-        r=requests.get(url=URL)
-        URL = "https://hansadrone.com/api/setMobileStatus?mStatus=unknown&apiKey=%s"%(APIkey)
-        r=requests.get(url=URL)
-        exit()
-      else :
-        await asyncio.sleep(5)
-        i+=1
+    # wait for mobile to connect. exit if not connected within 60 s
+    await getmStatus("connected", False, 60, APIkey)
 
-    # update backend status to available, this triggers UI flow on the smartphone app to define a corridor
+    # update backend status to "available", this triggers UI flow on the smartphone app to define a new corridor
     print("-- Setting drone status to available")
     URL = "https://hansadrone.com/api/setDroneStatus?dStatus=available&apiKey=%s"%(APIkey)
     r=requests.get(url=URL)
 
-    # while loop to wait for the customer to define a corridor. exit if not defined within 60 s
-    print("-- waiting 60s for mobile to define corridor...")
-    URL = "https://hansadrone.com/api/getMobileStatus/?apiKey=%s"%(APIkey)
-    i=0
-    while i<12 :
-      r=requests.get(url=URL)
-      data = r.json()
-      MSTATUS=data['status']
-      if MSTATUS=="defined" :
-        print("Mobile Status: %s"%(MSTATUS))
-        i=12
-      elif i==11 :
-        print("connection timed out, aborting")
-        URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
-        r=requests.get(url=URL)
-        URL = "https://hansadrone.com/api/setMobileStatus?mStatus=unknown&apiKey=%s"%(APIkey)
-        r=requests.get(url=URL)
-        exit()
-      else :
-        await asyncio.sleep(5)
-        i+=1
+    # wait 60s for mobile app to have corridor defined.
+    await getmStatus("defined", False, 60, APIkey)
 
     # wait for smartphone app and backend to sync the corridor data
     await asyncio.sleep(5)
@@ -242,7 +231,7 @@ async def run():
       fwd_azimuth=fwd_azimuth-360
     print("-- Bearing from takeoff position to fixpoint: %s" %fwd_azimuth)
 
-    # update backend status to underway
+    # update backend status to "underway"
     print("-- Setting drone status to underway")
     URL = "https://hansadrone.com/api/setDroneStatus?dStatus=underway&apiKey=%s"%(APIkey)
     r=requests.get(url=URL)
@@ -296,37 +285,15 @@ async def run():
     await asyncio.sleep(2)
 
 
-    # update backend status to atfixpoint. this will activate drone recognition on the smartphone app
+    # update backend status to "atfixpoint". This will notify the customer and activate drone recognition on the smartphone app
     # turn on drone lights here
     print("-- Setting drone status to atfixpoint")
     URL = "https://hansadrone.com/api/setDroneStatus?dStatus=atfixpoint&apiKey=%s"%(APIkey)
     r=requests.get(url=URL)
     await asyncio.sleep(3)
 
-    # while loop to wait for drone to be recognized. exit if not recognized within 60 s
-    print("-- waiting 60s for drone to be recognized...")
-    URL = "https://hansadrone.com/api/getMobileStatus/?apiKey=%s"%(APIkey)
-    i=0
-    while i<12 :
-      r=requests.get(url=URL)
-      data = r.json()
-      MSTATUS=data['status']
-      if MSTATUS=="recognized" :
-        print("Mobile Status: %s"%(MSTATUS))
-        i=12
-      elif i==11 :
-        print("connection timed out, flying back home")
-        URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
-        r=requests.get(url=URL)
-        URL = "https://hansadrone.com/api/setMobileStatus?mStatus=unknown&apiKey=%s"%(APIkey)
-        r=requests.get(url=URL)
-        print("-- returning home")
-        await drone.action.return_to_launch()
-        i=12
-        exit()
-      else :
-        await asyncio.sleep(5)
-        i+=1
+    # wait for drone to be recognized. return home if not recognized within 60 s
+    await getmStatus("recognized", True, 60, APIkey)
 
     # offboard mode defaults
     s_distance=1000;
@@ -334,6 +301,7 @@ async def run():
     east=0.0
     altitude2=-alt_cruise
     comp1RAD = comp1 *pi/180
+    # set min takeoff altitude to 0 to allow switch back from offboard mode to gotolocation
     print("-- setting min takeoff altitude to 0m for approach")
     await drone.action.set_takeoff_altitude(0.00)
 
@@ -393,35 +361,12 @@ async def run():
       return
 
     # this part to be repeated for each step until drone has reached sensor contact
-    # stop loop if distance < 765cm or <alt_user + 2 meters and start final approach mode
+    # stop loop if distance < sensor_range or < alt_user + 2 meters and start final approach mode
     # all angles in RAD in this section
-
     while s_distance>=sensor_range and (alt+z) >(alt_user+2):
 
-      # while loop to wait for drone to be recognized. exit if not recognized within 10 s
-      print("-- waiting 10s for drone to be recognized...")
-      URL = "https://hansadrone.com/api/getMobileStatus/?apiKey=%s"%(APIkey)
-      i=0
-      while i<11 :
-        r=requests.get(url=URL)
-        data = r.json()
-        MSTATUS=data['status']
-        if MSTATUS=="recognized" :
-          print("Mobile Status: %s"%(MSTATUS))
-          i=11
-        elif i==10 :
-          print("-- returning home")
-          await drone.action.return_to_launch()
-          i=11
-          print("connection timed out, flying back home")
-          URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
-          r=requests.get(url=URL)
-          URL = "https://hansadrone.com/api/setMobileStatus?mStatus=unknown&apiKey=%s"%(APIkey)
-          r=requests.get(url=URL)
-          exit()
-        else :
-          await asyncio.sleep(1)
-          i+=1
+      # wait for drone to be recognized. return home if not recognized within 15 s
+      await getmStatus("recognized", True, 15, APIkey)
 
       # get deviations from server
       URL = "https://hansadrone.com/api/getDeviations/?apiKey=%s"%(APIkey)
@@ -448,15 +393,15 @@ async def run():
       absY = dist * tan(angY)
       print("distance: " + str(dist)+ " altitude: " + str(alt) + " steplength:" +str(stepLength)+" absX: " + str(absX) + " absY: " + str(absY))
 
-      # calculate new x position: moving inwards absX at corrected angle, moving forwards at stepLength
-      # todo: catch 0 and 360 degree issues and validate formula
+      # calculate new x position: moving inwards absX at corrected angle, moving forward at stepLength
       l=sqrt(absX**2 + stepLength**2)
       if angX < 0:
-        stepAngle = comp1RAD -0.5*pi + angleRAD + asin(stepLength/l)
+        stepAngle = comp1RAD -0.5*pi - angleRAD + asin(stepLength/l)
       else:
         stepAngle = comp1RAD +0.5*pi -angleRAD - asin(stepLength/l)
       if stepAngle > 2*pi:
         stepAngle = stepAngle -2*pi
+      # converting new x position to real world coordinates
       north = l * cos(stepAngle)
       east = l * sin(stepAngle)
 
@@ -477,12 +422,9 @@ async def run():
       v_east = east / t
       v_down = (alt+down) / t
 
-      # Start offboard mode NEDvelocity for time t and then stop again
-      # flying 2 seconds longer than calculated to allow the drone to start/stop
+      # Start offboard mode NEDvelocity
       print("-- Starting offboard velocity_NED. V_north:" + str(v_north) + " v_east: "+ str(v_east) +" v_down: " + str(v_down) + " time: " + str(t))
       await drone.offboard.set_velocity_ned(VelocityNedYaw(v_north, v_east, v_down, yaw))
-      # await asyncio.sleep(t+speedup)
-
       # monitor altitude until calculated altitude reached
       while alt > -down+1:
         async for pos in drone.telemetry.position():
@@ -490,18 +432,17 @@ async def run():
           print("altitude: %.2fm" % alt)
           break
         await asyncio.sleep(1)
-
+      # stop at new setpoint
       await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, yaw))
       await asyncio.sleep(1)
 
       # get sensor distance
-      # this will only be used if distance_sensor= in hansadrone.ini file
+      # this will only be used if distance_sensor=true in hansadrone.ini file
       if distance_sensor:
         async for sensor in drone.telemetry.distance_sensor():
           s_distance=sensor.current_distance_m
           print("sensor distance: %s"%(s_distance))
           break
-
 
       await asyncio.sleep(1)
 
@@ -510,7 +451,7 @@ async def run():
 
     # end of while loop
 
-    # final approach. user can turn his smartphone away now, open hatch and turn off the light
+    # final approach. user can put his smartphone away now, drone will open hatch and turn off the light
     print("-- Starting final approach")
 
     # update backend status to "arrived" to trigger the UI in the app to put the smartphone aside
@@ -545,7 +486,6 @@ async def run():
       absY=distance * sin(angY)
 
       # calculate final x position: moving inwards at recognized angle, forward at distance
-      # todo: catch 0 and 360 degree issues and validate formula
       if angX < 0:
         stepAngle = comp1RAD -angX
       else:
@@ -600,7 +540,7 @@ async def run():
         return
     # end of final step
 
-    # update backend status to completed
+    # update backend status to "completed"
     print("-- Setting drone status to completed")
     URL = "https://hansadrone.com/api/setDroneStatus?dStatus=completed&apiKey=%s"%(APIkey)
     r=requests.get(url=URL)
@@ -629,8 +569,6 @@ async def run():
 
     # fly back to takeoff position
     print("-- flying to takeoff position")
-    # altitude1 is absolute height above NN
-    altitude1=alt_cruise+z
     await drone.action.goto_location(x, y, altitude1, back_azimuth)
     distance=20.00
     while distance > 1.0:
@@ -657,14 +595,15 @@ async def run():
         print("Latitude: %s, Longitude: %s, Altitude: %.2fm"%(lat, lon, alt))
         break
       await asyncio.sleep(1)
-    # end of while
 
+    # set drone status and mobile status to default values
     print("-- Setting drone status to unknown")
     URL = "https://hansadrone.com/api/setDroneStatus?dStatus=unknown&apiKey=%s"%(APIkey)
     r=requests.get(url=URL)
     URL = "https://hansadrone.com/api/setMobileStatus?mStatus=unknown&apiKey=%s"%(APIkey)
     r=requests.get(url=URL)
 
+    # disarm the drone
     await asyncio.sleep(10)
     print("-- disarming")
     await drone.action.disarm()
